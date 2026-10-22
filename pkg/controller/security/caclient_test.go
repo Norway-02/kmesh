@@ -19,8 +19,10 @@ package security
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -188,6 +190,25 @@ func TestClient(t *testing.T) {
 		server.Authenticator.Set("", "istiod.istio-system.svc")
 		checkSign(t, cli, false)
 	})
+
+	t.Run("GrpcConnect error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		patches.ApplyFunc(nets.GrpcConnect, func(addr string) (*grpc.ClientConn, error) {
+			return nil, errors.New("connection failed")
+		})
+		defer patches.Reset()
+
+		cli, err := newCaClient(nil, nil)
+		if err == nil {
+			t.Fatal("expected error from newCaClient, got nil")
+		}
+		if !strings.Contains(err.Error(), "failed to create grpcconnect") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+		if cli != nil {
+			t.Errorf("expected nil client, got %v", cli)
+		}
+	})
 }
 
 func TestCaClient(t *testing.T) {
@@ -205,6 +226,16 @@ func TestCaClient(t *testing.T) {
 			server:       mockIstioServer{Certs: []string{}, Err: nil},
 			expectedCert: nil,
 			expectedErr:  "invalid empty CertChain",
+		},
+		"Single cert response": {
+			server:       mockIstioServer{Certs: []string{"kmesh"}, Err: nil},
+			expectedCert: nil,
+			expectedErr:  "invalid empty CertChain",
+		},
+		"Server error": {
+			server:       mockIstioServer{Err: errors.New("rpc error: ca service unavailable")},
+			expectedCert: nil,
+			expectedErr:  "create certificate failed",
 		},
 	}
 
@@ -241,4 +272,200 @@ func TestCaClient(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestStandardCerts(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    []string
+		expected string
+	}{
+		{
+			name:     "empty slice",
+			input:    []string{},
+			expected: "",
+		},
+		{
+			name:     "nil slice",
+			input:    nil,
+			expected: "",
+		},
+		{
+			name:     "single cert with newline",
+			input:    []string{"CERT1\n"},
+			expected: "CERT1\n",
+		},
+		{
+			name:     "single cert without newline",
+			input:    []string{"CERT1"},
+			expected: "CERT1",
+		},
+		{
+			name:     "multiple certs without trailing newlines",
+			input:    []string{"CERT1", "CERT2", "CERT3"},
+			expected: "CERT1\nCERT2\nCERT3",
+		},
+		{
+			name:     "multiple certs with trailing newlines",
+			input:    []string{"CERT1\n", "CERT2\n", "CERT3\n"},
+			expected: "CERT1\nCERT2\nCERT3\n",
+		},
+		{
+			name:     "mixed certs with and without trailing newlines",
+			input:    []string{"CERT1\n", "CERT2", "CERT3\n"},
+			expected: "CERT1\nCERT2\nCERT3\n",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := standardCerts(tc.input)
+			if string(res) != tc.expected {
+				t.Errorf("standardCerts(%v) = %q, want %q", tc.input, string(res), tc.expected)
+			}
+		})
+	}
+}
+
+func TestFetchCert(t *testing.T) {
+	certChainBytes, err := os.ReadFile(filepath.Join("testdata", "cert-chain.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootCertBytes, err := os.ReadFile(filepath.Join("testdata", "root-cert.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	identity := "spiffe://cluster.local/ns/default/sa/default"
+
+	t.Run("successful fetch cert", func(t *testing.T) {
+		validCerts := []string{string(certChainBytes), string(rootCertBytes)}
+		server := mockIstioServer{Certs: validCerts, Err: nil}
+		address := serve(t, server)
+
+		patches := gomonkey.NewPatches()
+		patches.ApplyFunc(nets.GrpcConnect, func(addr string) (*grpc.ClientConn, error) {
+			return GrpcConnect(address, "")
+		})
+		defer patches.Reset()
+
+		opts := NewSecurityOptions()
+		cli, err := newCaClient(opts, nil)
+		if err != nil {
+			t.Fatalf("failed to create ca client: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = cli.Close()
+		})
+
+		secretItem, err := cli.FetchCert(identity)
+		if err != nil {
+			t.Fatalf("FetchCert failed: %v", err)
+		}
+		if secretItem == nil {
+			t.Fatal("expected non-nil secretItem")
+		}
+		if secretItem.ResourceName != identity {
+			t.Errorf("expected ResourceName %s, got %s", identity, secretItem.ResourceName)
+		}
+		if len(secretItem.CertificateChain) == 0 {
+			t.Error("expected non-empty CertificateChain")
+		}
+		if len(secretItem.PrivateKey) == 0 {
+			t.Error("expected non-empty PrivateKey")
+		}
+		if string(secretItem.RootCert) != string(rootCertBytes) {
+			t.Errorf("expected RootCert %s, got %s", string(rootCertBytes), string(secretItem.RootCert))
+		}
+		if secretItem.ExpireTime.IsZero() {
+			t.Error("expected non-zero ExpireTime")
+		}
+	})
+
+	t.Run("server error on CsrSend", func(t *testing.T) {
+		server := mockIstioServer{Err: errors.New("ca service unavailable")}
+		address := serve(t, server)
+
+		patches := gomonkey.NewPatches()
+		patches.ApplyFunc(nets.GrpcConnect, func(addr string) (*grpc.ClientConn, error) {
+			return GrpcConnect(address, "")
+		})
+		defer patches.Reset()
+
+		opts := NewSecurityOptions()
+		cli, err := newCaClient(opts, nil)
+		if err != nil {
+			t.Fatalf("failed to create ca client: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = cli.Close()
+		})
+
+		secretItem, err := cli.FetchCert(identity)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "create certificate failed") {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if secretItem != nil {
+			t.Errorf("expected nil secretItem, got %v", secretItem)
+		}
+	})
+
+	t.Run("parse cert error from invalid PEM", func(t *testing.T) {
+		server := mockIstioServer{Certs: []string{"invalid-pem-cert-1", "invalid-pem-cert-2"}, Err: nil}
+		address := serve(t, server)
+
+		patches := gomonkey.NewPatches()
+		patches.ApplyFunc(nets.GrpcConnect, func(addr string) (*grpc.ClientConn, error) {
+			return GrpcConnect(address, "")
+		})
+		defer patches.Reset()
+
+		opts := NewSecurityOptions()
+		cli, err := newCaClient(opts, nil)
+		if err != nil {
+			t.Fatalf("failed to create ca client: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = cli.Close()
+		})
+
+		secretItem, err := cli.FetchCert(identity)
+		if err == nil {
+			t.Fatal("expected error parsing invalid cert PEM, got nil")
+		}
+		if !strings.Contains(err.Error(), "failed to extract expire time") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+		if secretItem != nil {
+			t.Errorf("expected nil secretItem, got %v", secretItem)
+		}
+	})
+
+	t.Run("generate CSR error from invalid options", func(t *testing.T) {
+		opts := &security.Options{
+			WorkloadRSAKeySize: -1,
+		}
+		patches := gomonkey.NewPatches()
+		patches.ApplyFunc(nets.GrpcConnect, func(addr string) (*grpc.ClientConn, error) {
+			return &grpc.ClientConn{}, nil
+		})
+		defer patches.Reset()
+
+		cli, err := newCaClient(opts, nil)
+		if err != nil {
+			t.Fatalf("failed to create ca client: %v", err)
+		}
+
+		secretItem, err := cli.FetchCert(identity)
+		if err == nil {
+			t.Fatal("expected GenCSR error, got nil")
+		}
+		if secretItem != nil {
+			t.Errorf("expected nil secretItem, got %v", secretItem)
+		}
+	})
 }
